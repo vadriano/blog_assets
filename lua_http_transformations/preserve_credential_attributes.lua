@@ -127,6 +127,11 @@ local function hasValue (tab, val)
     return false
 end
 
+--[[
+Retrieves a table of attributes we are preserving through a stepup operation, or establishes an empty list if none.
+If validation of any existing attribute storage fails, then a new empty list is returned.
+--]]
+
 local function getSessionAttrsObj()
 
     local sessionAttrObjStr = nil
@@ -135,9 +140,9 @@ local function getSessionAttrsObj()
     if (STATE_STORAGE_STRATEGY == "session") then
         sessionAttrObjStr = (Session.getSessionAttribute(SESSION_ATTROBJ_NAME) or "{}")
     else
-        -- alternative approach: uses a signed and encrypted data structure, tranformed into a string and stored as a cookie
+        -- alternative approach: uses an encrypted data structure, tranformed into a string and stored as a cookie
         -- the data structure contains expiry and subject attributes to ensure it is short-lived and is not used
-        -- by a user other than the one for which it was created.
+        -- by a user other than the one for which it was created if verify-step-user is true in WebSEAL
         sessionAttrObjStr = "{}"
         local cookieStrValue = HTTPRequest.getCookie(SESSION_ATTROBJ_NAME)
         if (cookieStrValue ~= nil) then
@@ -202,15 +207,18 @@ local function getSessionAttrsObj()
     return cjson.decode(sessionAttrObjStr)
 end
 
+--[[
+Saves a list of attributes that we plan to propagate through stepup authentication.
+--]]
 local function saveSessionAttrsObj(o)
 
     if (STATE_STORAGE_STRATEGY == "session") then
         -- this is the preferred approach, however Session currently not available in postauthn mapping rule
         Session.setSessionAttribute(SESSION_ATTROBJ_NAME, cjson.encode(o))
     else
-        -- alternative approach: uses a signed and encrypted data structure, tranformed into a string and stored as a cookie
+        -- alternative approach: uses an encrypted data structure, tranformed into a string and stored as a cookie
         -- the data structure contains expiry and subject attributes to ensure it is short-lived and is not used
-        -- by a user other than the one for which it was created.
+        -- by a user other than the one for which it was created if verify-step-user is true in WebSEAL
         local cookieValue = nil
         if (STATE_COOKIE_GENERATION_VERSION == 1) then
             -- never actually use this version in production as its completely insecure. Just for testing purposes.
