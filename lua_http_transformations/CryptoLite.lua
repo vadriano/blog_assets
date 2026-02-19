@@ -3,10 +3,15 @@ Set of crypto functions built on basexx and openssl capabilities
 --]]
 
 -- Dependencies
+local logger = require 'LoggingUtils'
 local baseutils = require 'basexx'
 local cipher = require "openssl.cipher"
 local rand = require "openssl.rand"
 local kdf = require "openssl.kdf"
+local pkey = require "openssl.pkey"
+local digest = require "openssl.digest"
+local hmac = require "openssl.hmac"
+local ber = require "ber"
 
 local CryptoLite = {}
 
@@ -39,6 +44,78 @@ local function deriveKey(passphrase, salt, iterations)
     local key = kdf.derive(params)
     
     return key, salt
+end
+
+local function removeLeadingZeros(data)
+    local leadingZeros = 0
+    for i = 1, #data do
+        if data:byte(i) ~= 0 then
+            break
+        end
+        leadingZeros = leadingZeros + 1
+    end
+    return data:sub(leadingZeros + 1)
+end
+
+local function padIfSigned(n)
+    local result = ''
+    -- check the leading byte of byte string n, and if it is > 127 then prepend 0x00 to n
+    local leadingByte = n:byte(1)
+    if (leadingByte > 127) then
+        result = "\x00" .. n
+    else
+        result = n
+    end
+    return result
+end
+
+local function getRandSFromOpenSSLECSignature(sigBytes)
+    local r = nil
+    local s = nil
+
+    local decodeResult = ber.decode(sigBytes)
+    if (decodeResult ~= nil and decodeResult["class"] == 0 and decodeResult["type"] == 16 and decodeResult["data"] ~= nil
+        and decodeResult["children"] ~= nil and #decodeResult["children"] == 2
+        and decodeResult["children"][1] ~= nil and decodeResult["children"][2] ~= nil
+        and decodeResult["children"][1]["class"] == 0 and decodeResult["children"][2]["class"] == 0
+        and decodeResult["children"][1]["type"] == 2 and decodeResult["children"][2]["type"] == 2
+    ) then
+        r = removeLeadingZeros(decodeResult["children"][1]["data"])
+        s = removeLeadingZeros(decodeResult["children"][2]["data"])
+
+        if (#r ~= 32 or #s ~= 32) then
+            logger.debugLog("CryptoLite:getRandSFromOpenSSLECSignature unexpected r and s lengths")
+            r = nil
+            s = nil
+        end
+    else
+        logger.debugLog("CryptoLite:getRandSFromOpenSSLECSignature unexpected decodeResult")
+    end
+
+    return r, s
+end
+
+local function getOpenSSLECSignatureFromRandS(r,s)
+    --
+    -- basically reverse the steps of getRandSFromOpenSSLECSignature()
+    --
+    local finalR = padIfSigned(r)
+    local finalS = padIfSigned(s)
+
+    local berR = ber.encode({ 
+        type = ber.Types.INTEGER,
+        data = finalR
+    })
+    local berS = ber.encode({ 
+        type = ber.Types.INTEGER,
+        data = finalS
+    })
+    local berSeq = ber.encode({ 
+    type = ber.Types.SEQUENCE,
+        data = berR .. berS
+     })
+
+    return berSeq
 end
 
 --[[
@@ -86,7 +163,7 @@ end
 
 --[[
     ============================================================================
-    Symmetric key encryption end decryption
+    Symmetric key encryption and decryption
     ============================================================================
 --]]
 
@@ -162,6 +239,219 @@ function CryptoLite.decryptSymmetric(encrypted, key)
     local plaintext = c:final(ciphertext)
     
     return plaintext
+end
+
+--[[
+    ============================================================================
+    Asymmetric key generation
+    ============================================================================
+--]]
+
+--[[
+    Generate RSA key pair
+    @param bits: Key size in bits (default: 2048, recommended: 2048 or 4096)
+    @return publicKeyPEM, privateKeyPEM: The generated key pair in PEM format
+--]]
+function CryptoLite.generateRSAKeyPair(bits)
+    bits = bits or 2048
+
+    local genParams = {
+        type = "RSA",
+        bits = bits,
+        e = 65537
+    }
+    
+    local key = pkey.new(genParams)
+    local publicKeyPEM = key:toPEM("public")
+    local privateKeyPEM = key:toPEM("private")
+    
+    return publicKeyPEM, privateKeyPEM
+end
+
+--[[
+    Generate ECDSA key pair
+    @param curve: Curve name (default: "prime256v1", options: "prime256v1", "secp384r1", "secp521r1")
+    @return publicKeyPEM, privateKeyPEM: The generated key pair in PEM format
+--]]
+function CryptoLite.generateECDSAKeyPair(curve)
+    curve = curve or "prime256v1"
+
+    local genParams = {
+        type = "EC",
+        curve = curve
+    }
+    
+    local key = pkey.new(genParams)
+    local publicKeyPEM = key:toPEM("public")
+    local privateKeyPEM = key:toPEM("private")
+    
+    return publicKeyPEM, privateKeyPEM
+end
+
+--[[
+    ============================================================================
+    DIGITAL SIGNATURE / VALIDATION FUNCTIONS (JWT-compatible: RS256, ES256, HS256)
+    ============================================================================
+--]]
+
+--[[
+    Sign data using RSA-SHA256 (RS256 - JWT algorithm)
+    @param data: The data to sign
+    @param privateKeyPEM: RSA private key in PEM format
+    @return signature: Base64URL-encoded signature
+--]]
+function CryptoLite.signRS256(data, privateKeyPEM)
+    if not data or not privateKeyPEM then
+        error("CryptoLite.signRS256: data and privateKeyPEM are required")
+    end
+    
+    -- Load private key
+    local privKey = pkey.new(privateKeyPEM)
+    
+    -- Create SHA-256 digest of the data
+    local md = digest.new("sha256")
+    
+    -- Sign the hash of data
+    local signature = privKey:sign(md:update(data))
+    
+    return CryptoLite.base64URLEncode(signature)
+end
+
+--[[
+    Verify RSA-SHA256 signature (RS256 - JWT algorithm)
+    @param data: The original data that was signed
+    @param signature: Base64URL-encoded signature
+    @param publicKeyPEM: RSA public key in PEM format
+    @return valid: Boolean indicating if signature is valid
+--]]
+function CryptoLite.verifyRS256(data, signature, publicKeyPEM)
+    if not data or not signature or not publicKeyPEM then
+        error("CryptoLite.verifyRS256: data, signature, and publicKeyPEM are required")
+    end
+    
+    -- Decode signature from base64url
+    local sig = CryptoLite.base64URLDecode(signature)
+    
+    -- Load public key
+    local pubKey = pkey.new(publicKeyPEM)
+    
+    -- Create SHA-256 digest of the data
+    local md = digest.new("sha256")
+    
+    -- Verify signature
+    local valid = pubKey:verify(sig, md:update(data))
+    
+    return valid
+end
+
+--[[
+    Sign data using ECDSA-SHA256 (ES256 - JWT algorithm)
+    @param data: The data to sign
+    @param privateKeyPEM: EC private key in PEM format
+    @return signature: Base64URL-encoded signature
+--]]
+function CryptoLite.signES256(data, privateKeyPEM)
+    if not data or not privateKeyPEM then
+        error("CryptoLite.signES256: data and privateKeyPEM are required")
+    end
+    
+    -- Load private key
+    local privKey = pkey.new(privateKeyPEM)
+    
+    -- Create SHA-256 digest of the data
+    local md = digest.new("sha256")
+    
+    -- Sign the hash of data
+    local sigBytes = privKey:sign(md:update(data))
+
+    -- extract R, S without padding from the OpenSSL formatted signature
+    -- then concatenate and base64urlencode to create JWT signature
+    local r, s = getRandSFromOpenSSLECSignature(sigBytes)
+
+    return CryptoLite.base64URLEncode(r .. s)
+end
+
+--[[
+    Verify ECDSA-SHA256 signature (ES256 - JWT algorithm)
+    @param data: The original data that was signed
+    @param signature: Base64URL-encoded signature
+    @param publicKeyPEM: EC public key in PEM format
+    @return valid: Boolean indicating if signature is valid
+--]]
+function CryptoLite.verifyES256(data, signature, publicKeyPEM)
+    if not data or not signature or not publicKeyPEM then
+        error("CryptoLite.verifyES256: data, signature, and publicKeyPEM are required")
+    end
+    
+    -- Re-create OpenSSL compatible signature format from JWT signature format
+    local sig = CryptoLite.base64URLDecode(signature)
+    if (#sig ~= 64) then
+        error("CryptoLite.verifyES256: signature is not 64 bytes long")
+    end
+    local r = string.sub(sig, 1, 32)
+    local s = string.sub(sig, 33, 64)
+    local opensslSig = getOpenSSLECSignatureFromRandS(r,s)
+
+    -- Load public key
+    local pubKey = pkey.new(publicKeyPEM)
+    
+    -- Create SHA-256 digest
+    local md = digest.new("sha256")
+    
+    -- Verify signature over digest of the data
+    local valid = pubKey:verify(opensslSig, md:update(data))
+    
+    return valid
+end
+
+
+--[[
+    Sign data using HMAC-SHA256 (HS256 - JWT algorithm)
+    @param data: The data to sign
+    @param secret: Shared secret key
+    @return signature: Base64URL-encoded HMAC signature
+--]]
+function CryptoLite.signHS256(data, secret)
+    if not data or not secret then
+        error("CryptoLite.signHS256: data and secret are required")
+    end
+    
+    -- Create HMAC with SHA-256
+    local h = hmac.new(secret, "sha256")
+    local signature = h:final(data)
+    
+    return CryptoLite.base64URLEncode(signature)
+end
+
+--[[
+    Verify HMAC-SHA256 signature (HS256 - JWT algorithm)
+    @param data: The original data that was signed
+    @param signature: Base64URL-encoded HMAC signature
+    @param secret: Shared secret key
+    @return valid: Boolean indicating if signature is valid
+--]]
+function CryptoLite.verifyHS256(data, signature, secret)
+    if not data or not signature or not secret then
+        error("CryptoLite.verifyHS256: data, signature, and secret are required")
+    end
+    
+    -- Compute expected signature
+    local expectedSignature = CryptoLite.signHS256(data, secret)
+    
+    -- Constant-time comparison to prevent timing attacks
+    local sig = CryptoLite.base64URLDecode(signature)
+    local expected = CryptoLite.base64URLDecode(expectedSignature)
+    
+    if #sig ~= #expected then
+        return false
+    end
+    
+    local result = 0
+    for i = 1, #sig do
+        result = result | (string.byte(sig, i) ~ string.byte(expected, i))
+    end
+    
+    return result == 0
 end
 
 return CryptoLite
