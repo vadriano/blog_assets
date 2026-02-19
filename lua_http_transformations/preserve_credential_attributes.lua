@@ -1,18 +1,27 @@
 --[[
-        NOTE: This transformation rule requires a fix to WebSEAL such that the Session attribute is
-        correctly made available to postauthn transformation rules. Without that fix, this will not work.
-        There is trace at the start of the rule that will print out if the rule detects you are running
-        on a version of WebSEAL that does not have the fix.
-
         A transformation that runs at the conclusion of each authentication method that it is configured
         against to propagate forward a set of credential attributes during stepup operations.
 
-        The way this works is that a session memory cache is used to collect the attributes to preserve. 
+        The way this works is that either an encrypted cookie, or a session memory cache is used to collect
+        and update the attributes to preserve at the conclusion of each authentication method.
+
+        Update the list of attributes you want to preserve below in the ATTR_NAMES variable.
+
         
         It is populated cumulatively at the end of every mechanism in a postauthn transformation.
         There is no pruning of attributes at any stage.
-        At the end of each authentication method, any attributes that are in the memory cache that are 
-        not seen in the credential are added back in.
+        At the end of each authentication method, any attributes that are in the preserve list are
+        added back in. There are merge strategies for attributes that are present in both the 
+        preserve list and the stepup credential. Normally I think you would want the "add" or
+        "replace" strategies.
+
+        NOTE: To use this transformation rule with server-side session state as the location to remember
+        the attributes to preserve during stepup, a fix is required for WebSEAL such that the Session 
+        id information is made available to postauthn transformation rules. Without that fix, 
+        STATE_STORAGE_STRATEGY="session" will not work.
+        There is trace at the start of the rule that will print out if the rule detects you are running
+        on a version of WebSEAL that does not have the fix and you are using "session" storage strategy.
+
 
         Activated in Reverse Proxy config with:
 
@@ -27,13 +36,22 @@
         request-match = postauthn:password
         request-match = postauthn:ext-auth-interface
 
+
+        # Don't forget to inject your own shared secret to be used for the cookie encryption/decryption
+        [http-transformations:secrets]
+        STATE_COOKIE_SHARED_SECRET=MySecureKey123!@#$%^&*()_+=-
+
+
         =============		
 --]]
 
 local cjson = require "cjson"
 local logger = require "LoggingUtils"
+local cryptoLite = require "CryptoLite"
 
 -- list of attribute names that we want to preserve through stepup operations
+-- There is no significance to the default one "method" - it's just a placehoder 
+-- that I was testing with, so delete/replace it with whatever attributes you care about.
 local ATTR_NAMES = { "method" }
 
 -- MERGE_STRATEGY determines whether to add, keep, or replace an attribute 
@@ -46,23 +64,55 @@ local ATTR_NAMES = { "method" }
 -- the value should be one of "add", "keep", "replace"
 local MERGE_STRATEGY = "add"
 
--- name of session attribute that stores the JSON of the table of 
+-- name of session attribute or cookie name that stores the JSON of the table of 
 -- attributes we are preserving through stepup operations
 local SESSION_ATTROBJ_NAME = "PRESERVE_SESSION_ATTRIBUTES"
 
+--
+-- One of "session", "cookie"
+-- The "session" option requires an update to WebSEAL that you may or may not have.
+-- If you do not, then an error will be printed to trace. 
+--
+local STATE_STORAGE_STRATEGY="cookie"
 
-local function getSessionAttrsObj()
-    local sessionAttrObjStr = (Session.getSessionAttribute(SESSION_ATTROBJ_NAME) or "{}")
-    --local sessionAttrObjStr = '{"method":["SSL Client Certificate"]}'
-    return cjson.decode(sessionAttrObjStr)
-end
+--
+-- Only used if STATE_STORAGE_STRATEGY is "cookie"
+-- do not use STATE_COOKIE_GENERATION_VERSION=1 for production - it is for development testing / visual inspection only
+-- always use version 2 (shared secret encrption of a JSON string)
+--
+local STATE_COOKIE_GENERATION_VERSION=2
+--local STATE_COOKIE_VALID_VERSIONS={1,2}
+local STATE_COOKIE_VALID_VERSIONS={2}
 
-local function saveSessionAttrsObj(o)
-    Session.setSessionAttribute(SESSION_ATTROBJ_NAME, cjson.encode(o))
-end
+-- It is expected that step-up occurs within this amount of seconds since the last authentication
+-- To disable this check, set to -1
+local MAX_COOKIE_AGE_SECONDS=-1
+
+-- read this from configuration file
+-- local STATE_COOKIE_SHARED_SECRET="MySecureKey123!@#$%^&*()_+=-"
+local STATE_COOKIE_SHARED_SECRET=Control.getConfig("http-transformations:secrets", "STATE_COOKIE_SHARED_SECRET")
+
+-- We also decide whether or not to check that the stepup user is the same as the original user based on existing WebSEAL config
+local configStr = Control.getConfig("step-up", "verify-step-up-user")
+local VERIFY_STEPUP_USER=(configStr ~= nil and (string.lower(configStr) == "true" or string.lower(configStr) == "yes"))
+
+
+
+
 
 --[[
-Checks if a table has a value
+START UTILITY FUNCTIONS
+--]]
+
+
+local function getCurrentUsername()
+    local username = Session.getCredentialAttribute("AZN_CRED_PRINCIPAL_NAME")
+    return username
+end
+
+
+--[[
+Checks if an array has a value
 --]]
 local function hasValue (tab, val)
     if tab == nil then
@@ -75,6 +125,130 @@ local function hasValue (tab, val)
     end
 
     return false
+end
+
+local function getSessionAttrsObj()
+
+    local sessionAttrObjStr = nil
+
+    -- this is the preferred approach, however Session currently not available in postauthn mapping rule
+    if (STATE_STORAGE_STRATEGY == "session") then
+        sessionAttrObjStr = (Session.getSessionAttribute(SESSION_ATTROBJ_NAME) or "{}")
+    else
+        -- alternative approach: uses a signed and encrypted data structure, tranformed into a string and stored as a cookie
+        -- the data structure contains expiry and subject attributes to ensure it is short-lived and is not used
+        -- by a user other than the one for which it was created.
+        sessionAttrObjStr = "{}"
+        local cookieStrValue = HTTPRequest.getCookie(SESSION_ATTROBJ_NAME)
+        if (cookieStrValue ~= nil) then
+            -- the cookie string value is of the format version_label:value where version_label allows us to
+            -- define, identify and support different formats should they change over time. Here we use
+            -- a regex match to extract the version label (integer) and the actual value.
+            local versionLabel, value = cookieStrValue:match("^(%d+):(.+)$")
+            if (versionLabel ~= nil and hasValue(STATE_COOKIE_VALID_VERSIONS, tonumber(versionLabel)) and value ~= nil) then
+                if (versionLabel == "1") then
+                    -- never actually use this version in production as its completely insecure. Just for testing purposes.
+                    sessionAttrObjStr = value
+                elseif (versionLabel == "2") then
+                    -- value should be a symmetrically encrypted string
+                    local success, jsonStr = pcall(cryptoLite.decryptSymmetric, value, STATE_COOKIE_SHARED_SECRET)
+                    if (success) then
+                        local stateJSON = cjson.decode(jsonStr)
+
+                        --logger.debugLog("stateJSON is: " .. cjson.encode(stateJSON))
+                    
+                        --
+                        -- validation checks of the stateJSON fields
+                        -- 
+                        local valid = true
+
+                        -- check expiry if present
+                        if (valid and stateJSON["exp"] ~= nil) then
+                            local nowSec = math.floor(os.time())
+                            local expSec = math.floor(stateJSON["exp"])
+                            logger.debugLog("Checking expiry time. Now: " .. nowSec .. " cookie exp: " .. expSec .. " remaining: " .. (expSec - nowSec))
+                            if (nowSec > expSec) then
+                                valid = false
+                                logger.debugLog("Cookie value has expired")
+                            end
+                        end
+
+                        -- if sub is present, check that it matches the current username
+                        if (valid and stateJSON["sub"] ~= nil) then
+                            if (stateJSON["sub"] ~= getCurrentUsername()) then
+                                valid = false
+                                logger.debugLog("Cookie value has incorrect sub field")
+                            end
+                        end
+
+                        if (valid) then
+                            -- all good, consume the attrsObj field from stateJSON
+                            sessionAttrObjStr = cjson.encode(stateJSON["attrsObj"])
+                        end
+                    else
+                        logger.debugLog("Failed to decrypt cookie value: " .. value)
+                    end
+                else
+                    logger.debugLog("Cookie value version not implemented:" .. versionLabel)
+                end
+            else
+                logger.debugLog("Cookie value is not in the expected format. versionLabel: " .. (versionLabel or 'nil') .. " value: " .. (value or 'nil'))
+            end
+        else
+            logger.debugLog("Cookie not found: " .. SESSION_ATTROBJ_NAME)
+        end
+    end
+
+    return cjson.decode(sessionAttrObjStr)
+end
+
+local function saveSessionAttrsObj(o)
+
+    if (STATE_STORAGE_STRATEGY == "session") then
+        -- this is the preferred approach, however Session currently not available in postauthn mapping rule
+        Session.setSessionAttribute(SESSION_ATTROBJ_NAME, cjson.encode(o))
+    else
+        -- alternative approach: uses a signed and encrypted data structure, tranformed into a string and stored as a cookie
+        -- the data structure contains expiry and subject attributes to ensure it is short-lived and is not used
+        -- by a user other than the one for which it was created.
+        local cookieValue = nil
+        if (STATE_COOKIE_GENERATION_VERSION == 1) then
+            -- never actually use this version in production as its completely insecure. Just for testing purposes.
+            cookieValue = "1:" .. cjson.encode(o)
+        elseif (STATE_COOKIE_GENERATION_VERSION == 2) then
+
+            local stateJSON = {}
+            stateJSON["attrsObj"] = o
+
+            -- if we are enforcing that the stepup username must be the same as the current username then insert the sub
+            if (VERIFY_STEPUP_USER) then
+                stateJSON["sub"] = getCurrentUsername()
+            end
+
+            -- insert expiry time if we are enforcing a max age
+            if (MAX_COOKIE_AGE_SECONDS > 0) then
+                expireAtSeconds = math.floor(os.time() + MAX_COOKIE_AGE_SECONDS)
+                stateJSON["exp"] = expireAtSeconds
+            end
+
+            -- build the version 2 cookie value
+            cookieValue = "2:" .. cryptoLite.encryptSymmetric(cjson.encode(stateJSON), STATE_COOKIE_SHARED_SECRET)
+        else
+            -- should not happen - means a development error or misconfiguration
+            logger.debugLog("Cookie version not yet supported")
+        end
+
+        -- add appropriate cookie attributes and set it on the response
+        local cookieValueStr = cookieValue .. ";path=/;Secure;HttpOnly"
+
+        -- Commented out since I don't think we shoud expire the cookie - just leave it as a 
+        -- session cookie since expiry is enforced at the application data level anyway.
+        --if (MAX_COOKIE_AGE_SECONDS > 0) then
+        --    cookieValueStr = cookieValueStr .. ";max-age=" .. MAX_COOKIE_AGE_SECONDS
+        --end
+
+        HTTPResponse.setCookie(SESSION_ATTROBJ_NAME, cookieValueStr)
+    end
 end
 
 --[[
@@ -102,12 +276,21 @@ local function fixArray(tab)
     return result
 end
 
+--[[
+END UTILITY FUNCTIONS
+--]]
+
+
+--[[
+START MAIN ENTRY POINT
+--]]
+
 
 
 logger.debugLog("preserve_credential_attributes called during stage: " .. Control.getStage())
 if (Control.getStage() == "postauthn") then
     -- detect if WebSEAL has the fix for making the Session available to the postauthn transformation state
-    if (Session.getSessionId() == nil) then
+    if (STATE_STORAGE_STRATEGY == "session" and Session.getSessionId() == nil) then
         logger.debugLog("preserve_credential_attributes: ******** ERROR: The version of WebSEAL you are running needs a fix to make the Session information available to the postauthn Lua transformation stage")
     else
         logger.debugLog("preserve_credential_attributes.AZN_CRED_AUTH_METHOD: " .. Session.getCredentialAttribute("AZN_CRED_AUTH_METHOD"))
