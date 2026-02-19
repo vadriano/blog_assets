@@ -4,21 +4,37 @@ Simple logging utilities
 local LoggingUtils = {}
 
 function LoggingUtils.dumpAsString(o)
-    if type(o) == 'table' then
-       local s = '{'
-       local first = true
-       for k,v in pairs(o) do
-          if not first then
+   if type(o) == 'table' then
+      local s = '{'
+      local first = true
+      for k,v in pairs(o) do
+         if not first then
             s = s .. ','
-          end
-          first = false
-          if type(k) ~= 'number' then k = '"'..k..'"' end
-          s = s .. '['..k..'] = ' .. LoggingUtils.dumpAsString(v)
-       end
-       return s .. '}'
-    else
-       return tostring(o)
-    end
+         end
+         first = false
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. LoggingUtils.dumpAsString(v)
+      end
+      return s .. '}'
+   elseif type(o) == 'string' then
+      -- check if every char is printable
+      -- if it is, return the string otherwise return a hex string
+      local isPrintable = true
+      for i = 1, #o do
+         local c = string.byte(string.sub(o,i,i))
+         if c < 32 or c > 126 then
+            isPrintable = false
+            break
+         end
+      end
+      if isPrintable then
+         return o
+      else
+         return 'ByteString[' .. LoggingUtils.toHexString(o) .. ']'
+      end
+   else
+      return tostring(o)
+   end
 end
 
 function LoggingUtils.debugLog(s)
