@@ -163,7 +163,33 @@ end
 
 --[[
     ============================================================================
-    Symmetric key encryption and decryption
+    UTILITY FUNCTIONS FOR HASH AND RANDOM (Public APIs)
+    ============================================================================
+--]]
+
+--[[
+    Utility function to hash a string using SHA-256
+    @param data: The string to hash
+    @return hash: Base64URL-encoded hash
+--]]
+function CryptoLite.sha256(data)
+    local md = digest.new("sha256")
+    local hash = md:final(data)
+    return CryptoLite.base64URLEncode(hash)
+end
+
+--[[
+    Utility function to generate random bytes
+    @param length: Number of random bytes to generate
+    @return bytes: Random bytes as a string
+--]]
+function CryptoLite.randomBytes(length)
+    return rand.bytes(length)
+end
+
+--[[
+    ============================================================================
+    Basic string symmetric key encryption and decryption
     ============================================================================
 --]]
 
@@ -452,6 +478,170 @@ function CryptoLite.verifyHS256(data, signature, secret)
     end
     
     return result == 0
+end
+
+--[[
+    ============================================================================
+    Asymmetric key ENCRYPTON / DECRYPTION FUNCTIONS (JWT/JWE-compatible)
+    ============================================================================
+--]]
+
+
+--[[
+    RSA Encryption
+    @param plaintext: The string to encrypt
+    @param publicKeyPEM: RSA public key in PEM format
+    @return encrypted: Base64URL-encoded encrypted data
+--]]
+function CryptoLite.encryptRSA(plaintext, publicKeyPEM)
+    if not plaintext or not publicKeyPEM then
+        error("CryptoLite.encryptRSA: plaintext and publicKeyPEM are required")
+    end
+    
+    -- Create cipher
+    --local c = cipher.new("rsa-pkcs1-oaep-padding")
+
+    -- Load public key
+    local pubKey = pkey.new(publicKeyPEM)
+    
+    -- RSA encryption (OAEP padding for security)
+    --local ciphertext = c:encrypt(pubKey, iv):final(plaintext)
+    
+    -- RSA encryption (OAEP padding for security)
+    local ciphertext = pubKey:encrypt(plaintext, pkey.RSA_PKCS1_OAEP_PADDING)
+
+
+    return CryptoLite.base64URLEncode(ciphertext)
+end
+
+--[[
+    RSA Decryption
+    @param encrypted: Base64URL-encoded encrypted data from encryptRSA
+    @param privateKeyPEM: RSA private key in PEM format
+    @return plaintext: The decrypted string
+--]]
+function CryptoLite.decryptRSA(encrypted, privateKeyPEM)
+    if not encrypted or not privateKeyPEM then
+        error("CryptoLite.decryptRSA: encrypted data and privateKeyPEM are required")
+    end
+    
+    -- Decode from base64url
+    local ciphertext = CryptoLite.base64URLDecode(encrypted)
+    
+    -- Load private key
+    local privKey = pkey.new(privateKeyPEM)
+    
+    -- RSA decryption
+    local plaintext = privKey:decrypt(ciphertext, pkey.RSA_PKCS1_OAEP_PADDING)
+    
+    return plaintext
+end
+
+--[[
+    ECDSA Hybrid Encryption (ECDH key exchange + AES-256-GCM)
+    Uses Elliptic Curve Diffie-Hellman for key exchange, then symmetric encryption
+    @param plaintext: The string to encrypt
+    @param publicKeyPEM: EC public key in PEM format
+    @return encrypted: Base64URL-encoded encrypted data with format: ephemeralPubKey:iv:tag:ciphertext
+    -- Not available because the luaossl in IVIA does not contain https://github.com/wahern/luaossl/pull/214
+--]]
+function CryptoLite.NOT_YET_AVAILABLE_IN_IVIA_encryptECDSA(plaintext, publicKeyPEM)
+    if not plaintext or not publicKeyPEM then
+        error("CryptoLite.encryptECDSA: plaintext and publicKeyPEM are required")
+    end
+    
+    -- Load recipient's public key
+    local recipientPubKey = pkey.new(publicKeyPEM)
+    
+    -- Get the curve name from the recipient's key
+    local recipientECKey = recipientPubKey:getParameters()
+    logger.debugLog("recipientECKey: " .. logger.dumpAsString(recipientECKey))
+
+    -- this doesn't work
+    --local curveName = recipientECKey:getCurveName()
+    local curveName = "prime256v1"
+    
+    -- Generate ephemeral key pair on the same curve
+    local genParams = {
+        type = "EC",
+        curve = curveName
+    }
+    local ephemeralKey = pkey.new(genParams)
+    
+    -- Perform ECDH to derive shared secret
+    logger.debugLog("ephemeralKey: " .. logger.dumpAsString(ephemeralKey))
+
+    -- unfortunately this requires https://github.com/wahern/luaossl/pull/214
+    -- and we don't have that in our luaossl
+    local sharedSecret = ephemeralKey:derive(recipientPubKey)
+    
+    -- Derive encryption key from shared secret using SHA-256
+    local md = digest.new("sha256")
+    local encKey = md:final(sharedSecret)
+    
+    -- Generate random IV (12 bytes for GCM)
+    local iv = rand.bytes(12)
+    
+    -- Create cipher
+    local c = cipher.new("aes-256-gcm")
+    
+    -- Encrypt
+    local ciphertext, tag = c:encrypt(encKey, iv):final(plaintext)
+    
+    -- Get ephemeral public key in PEM format
+    local ephemeralPubKeyPEM = ephemeralKey:toPEM("public")
+    
+    -- Combine ephemeralPubKey:iv:tag:ciphertext
+    -- Store lengths to help with parsing
+    local ephemeralPubKeyLen = string.pack(">I4", #ephemeralPubKeyPEM)
+    local combined = ephemeralPubKeyLen .. ephemeralPubKeyPEM .. iv .. tag .. ciphertext
+    
+    return CryptoLite.base64URLEncode(combined)
+end
+
+--[[
+    ECDSA Hybrid Decryption
+    @param encrypted: Base64URL-encoded encrypted data from encryptECDSA
+    @param privateKeyPEM: EC private key in PEM format
+    @return plaintext: The decrypted string
+    -- Not available because the luaossl in IVIA does not contain https://github.com/wahern/luaossl/pull/214
+--]]
+function CryptoLite.NOT_YET_AVAILABLE_IN_IVIA_decryptECDSA(encrypted, privateKeyPEM)
+    if not encrypted or not privateKeyPEM then
+        error("CryptoLite.decryptECDSA: encrypted data and privateKeyPEM are required")
+    end
+    
+    -- Decode from base64url
+    local combined = CryptoLite.base64URLDecode(encrypted)
+    
+    -- Extract ephemeral public key length
+    local ephemeralPubKeyLen = string.unpack(">I4", combined:sub(1, 4))
+    
+    -- Extract components
+    local ephemeralPubKeyPEM = combined:sub(5, 4 + ephemeralPubKeyLen)
+    local iv = combined:sub(5 + ephemeralPubKeyLen, 16 + ephemeralPubKeyLen)
+    local tag = combined:sub(17 + ephemeralPubKeyLen, 32 + ephemeralPubKeyLen)
+    local ciphertext = combined:sub(33 + ephemeralPubKeyLen)
+    
+    -- Load private key and ephemeral public key
+    local privKey = pkey.new(privateKeyPEM)
+    local ephemeralPubKey = pkey.new(ephemeralPubKeyPEM)
+    
+    -- Perform ECDH to derive shared secret
+    -- unfortunately this requires https://github.com/wahern/luaossl/pull/214
+    local sharedSecret = privKey:derive(ephemeralPubKey)
+    
+    -- Derive decryption key from shared secret using SHA-256
+    local md = digest.new("sha256")
+    local encKey = md:final(sharedSecret)
+    
+    -- Create cipher
+    local c = cipher.new("aes-256-gcm")
+    
+    -- Decrypt
+    local plaintext = c:decrypt(encKey, iv, tag):final(ciphertext)
+    
+    return plaintext
 end
 
 return CryptoLite

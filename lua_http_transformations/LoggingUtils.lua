@@ -32,6 +32,8 @@ function LoggingUtils.dumpAsString(o)
       else
          return 'ByteString[' .. LoggingUtils.toHexString(o) .. ']'
       end
+   elseif type(o) == 'function' then
+      return 'Function[' .. k .. ']'
    else
       return tostring(o)
    end
@@ -43,11 +45,9 @@ function LoggingUtils.debugLog(s)
 end
 
 function LoggingUtils.toHexString(s)
-   local res = ''
-   for i = 1, #s do
-      res = res .. string.format("%02x", string.byte(string.sub(s,i,i)))
-   end
-   return res
+   return (s:gsub('.', function(c)
+        return string.format('%02x', string.byte(c))
+    end))
 end
 
 function LoggingUtils.dumpRequest()
