@@ -11,7 +11,23 @@
         request-match = request:POST /certeai *
         =============
 		
-		You would also need to set up certificate EAI to point at /certeai.
+		You would also need to set up certificate EAI to point at /certeai, and of course have something configured for certificate authentication.
+
+
+        [certificate]
+        accept-client-certs = something_other_than_never
+
+        # This will be intercepted by a Lua HTTP transformation
+        eai-uri = /certeai
+
+        # There can be other eai-data, but I prefer to have the whole cert and unpack it myself in Lua
+        eai-data = Base64Certificate:cert
+
+        ======================
+
+        Typically you would also find level=ssl somewhere in the [authentication-levels] stanza.
+
+        
 		
 		For information on the openssl.x509 APIs, consult the luaossl PDF found here: 
 			https://www.25thandclement.com/~william/projects/luaossl.pdf
